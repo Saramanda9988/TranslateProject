@@ -1,0 +1,243 @@
+# =============================================
+# 📅 工作流名称：检查上游已翻译的内核文档
+# ✅ 每天 UTC 02:00 自动扫描 + 支持手动触发
+# ✅ 检查 sources/kernel/**/*.md 中 status: collected 或 status: translating 的文档
+# ✅ 对比上游是否已存在中文翻译版本
+# ✅ 通过飞书通知管理员检查结果
+# =============================================
+
+name: Check Upstream Kernel Translations
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # 每天 UTC 02:00
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    steps:
+
+      # 🧱 步骤 1：检出代码
+      - name: 🔍 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # 📦 步骤 2：安装 yq（用于解析 YAML）
+      - name: 📦 Install yq
+        run: |
+          wget -q https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
+          chmod +x /usr/local/bin/yq
+
+      # ✅ 步骤 3：验证 yq
+      - name: ✅ Verify yq
+        run: yq --version
+
+      # 🔍 步骤 4：检查上游翻译
+      - name: 🔍 Check upstream translations
+        id: check_translations
+        run: |
+          echo "开始检查上游翻译..."
+          
+          # 创建临时目录
+          TEMP_DIR=$(mktemp -d)
+          trap 'rm -rf "$TEMP_DIR"' EXIT
+          
+          # 存储发现的已翻译文档
+          FOUND_TRANSLATIONS="found_translations.txt"
+          touch "$FOUND_TRANSLATIONS"
+          
+          # 统计
+          TOTAL_CHECKED=0
+          
+          # 遍历所有 kernel 目录下的 .md 文件
+          while IFS= read -r file; do
+            # 直接使用 yq 读取文件
+            STATUS=$(yq eval '.status // ""' "$file" 2>/dev/null)
+            LINK=$(yq eval '.link // ""' "$file" 2>/dev/null)
+            TITLE=$(yq eval '.title // ""' "$file" 2>/dev/null)
+            UPSTREAM_TRANSLATED=$(yq eval '.upstream_translated // ""' "$file" 2>/dev/null)
+            
+            # 如果无法读取任何字段，跳过
+            if [ -z "$STATUS" ] && [ -z "$LINK" ]; then
+              continue
+            fi
+            
+            # 只检查 status: collected 或 status: translating
+            if [ "$STATUS" != "collected" ] && [ "$STATUS" != "translating" ]; then
+              continue
+            fi
+            
+            # 跳过已标记的文档
+            if [ "$UPSTREAM_TRANSLATED" = "true" ]; then
+              continue
+            fi
+            
+            if [ -z "$LINK" ]; then
+              echo "⚠️ $file: 缺少 link 字段"
+              continue
+            fi
+            
+            TOTAL_CHECKED=$((TOTAL_CHECKED + 1))
+            
+            echo "📄 检查文件 [$TOTAL_CHECKED]: $file"
+            echo "   状态: $STATUS"
+            
+            # 从 link 提取文档路径
+            DOC_PATH=$(echo "$LINK" | sed -n 's|.*tree/\(Documentation/.*\)|\1|p')
+            
+            if [ -z "$DOC_PATH" ]; then
+              echo "   ⚠️ 无法从 link 提取文档路径"
+              continue
+            fi
+            
+            # 构造中文翻译路径
+            DOC_RELATIVE=$(echo "$DOC_PATH" | sed 's|^Documentation/||')
+            ZH_CN_PATH="Documentation/translations/zh_CN/${DOC_RELATIVE}"
+            ZH_CN_URL="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/${ZH_CN_PATH}"
+            
+            # 检查上游是否存在中文翻译（HTTP HEAD 请求）
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -L --max-time 10 "$ZH_CN_URL" 2>/dev/null || echo "000")
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "   ✅ 发现上游翻译！"
+              # 记录发现的翻译
+              echo "$file|$TITLE|$STATUS|$LINK|$ZH_CN_URL" >> "$FOUND_TRANSLATIONS"
+            else
+              echo "   ℹ️ 上游暂无中文翻译 (HTTP $HTTP_CODE)"
+            fi
+            
+            # 避免请求过快
+            sleep 0.5
+          done < <(find sources/kernel -name "*.md" -type f)
+          
+          # 统计结果
+          FOUND_COUNT=$(wc -l < "$FOUND_TRANSLATIONS" 2>/dev/null || echo "0")
+          
+          echo ""
+          echo "========================================="
+          echo "📊 检查完成"
+          echo "========================================="
+          echo "总共检查: $TOTAL_CHECKED 个文档"
+          echo "发现上游翻译: $FOUND_COUNT 个"
+          
+          # 设置输出
+          echo "total_checked=$TOTAL_CHECKED" >> $GITHUB_OUTPUT
+          echo "found_count=$FOUND_COUNT" >> $GITHUB_OUTPUT
+          
+          if [ "$FOUND_COUNT" -gt 0 ]; then
+            echo "has_translations=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_translations=false" >> $GITHUB_OUTPUT
+          fi
+
+      # 🚨 步骤 5：发送飞书通知
+      - name: 🚨 Send Feishu notification
+        run: |
+          echo "发送飞书通知..."
+          
+          # 检查是否配置了飞书 Webhook
+          if [ -z "$FEISHU_WEBHOOK_URL" ]; then
+            echo "⚠️ 未配置 FEISHU_WEBHOOK_URL，跳过飞书通知"
+            echo "💡 如需启用飞书通知，请在 GitHub Secrets 中配置 FEISHU_WEBHOOK_URL"
+            exit 0
+          fi
+          
+          TOTAL_CHECKED="${{ steps.check_translations.outputs.total_checked }}"
+          FOUND_COUNT="${{ steps.check_translations.outputs.found_count }}"
+          HAS_TRANSLATIONS="${{ steps.check_translations.outputs.has_translations }}"
+          
+          # 检查是否发现翻译
+          if [ "$HAS_TRANSLATIONS" = "true" ] && [ -f found_translations.txt ] && [ -s found_translations.txt ]; then
+            # 发现了上游翻译
+            echo "发现 $FOUND_COUNT 个上游已翻译的文档"
+            
+            # 构造卡片 elements
+            ELEMENTS='[
+              {
+                "tag": "div",
+                "text": {
+                  "tag": "lark_md",
+                  "content": "**🎉 发现上游已翻译的内核文档**\\n\\n本次检查了 '"$TOTAL_CHECKED"' 个待翻译文档，发现 '"$FOUND_COUNT"' 个在 Linux 内核上游已存在中文翻译，建议停止重复翻译工作："
+                }
+              }'
+            
+            while IFS='|' read -r file title status link zh_cn_url; do
+              # 转义特殊字符
+              SAFE_FILE=$(echo "$file" | sed 's/"/\\"/g')
+              SAFE_TITLE=$(echo "$title" | sed 's/"/\\"/g')
+              SAFE_LINK=$(echo "$link" | sed 's/"/\\"/g')
+              SAFE_ZH_URL=$(echo "$zh_cn_url" | sed 's/"/\\"/g')
+              
+              ELEMENTS="$ELEMENTS,
+              {
+                \"tag\": \"div\",
+                \"text\": {
+                  \"tag\": \"lark_md\",
+                  \"content\": \"📄 **文件**: \`$SAFE_FILE\`\\n📌 **标题**: $SAFE_TITLE\\n🔖 **状态**: $status\\n🔗 **原文**: $SAFE_LINK\\n🇨🇳 **上游中文**: $SAFE_ZH_URL\\n\"
+                }
+              }"
+            done < found_translations.txt
+            
+            ELEMENTS="$ELEMENTS
+            ]"
+            
+            # 构造完整卡片 JSON
+            CARD_JSON=$(jq -n \
+              --arg title "⚠️ 发现上游已翻译的内核文档" \
+              --arg color "orange" \
+              --argjson elements "$ELEMENTS" \
+              '{
+                "config": {"wide_screen_mode": true},
+                "header": {
+                  "template": $color,
+                  "title": {"content": $title, "tag": "plain_text"}
+                },
+                "elements": $elements
+              }')
+          else
+            # 未发现上游翻译
+            echo "未发现上游已翻译的文档"
+            
+            CARD_JSON=$(jq -n \
+              --arg title "✅ 上游翻译检查完成" \
+              --arg color "green" \
+              --arg total "$TOTAL_CHECKED" \
+              --arg time "$(date '+%Y-%m-%d %H:%M:%S UTC')" \
+              '{
+                "config": {"wide_screen_mode": true},
+                "header": {
+                  "template": $color,
+                  "title": {"content": $title, "tag": "plain_text"}
+                },
+                "elements": [
+                  {
+                    "tag": "div",
+                    "text": {
+                      "tag": "lark_md",
+                      "content": ("**✅ 检查完成**\\n\\n本次检查了 " + $total + " 个待翻译文档（status: collected 或 translating），未发现上游已翻译的内核文档。\\n\\n所有待翻译文档在上游都没有中文版本，可以继续翻译工作。\\n\\n**检查时间**: " + $time)
+                    }
+                  }
+                ]
+              }')
+          fi
+          
+          # 发送飞书通知
+          echo "📤 正在发送飞书卡片..."
+          RESPONSE=$(curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"msg_type\": \"interactive\", \"card\": $CARD_JSON}" \
+            "$FEISHU_WEBHOOK_URL")
+          
+          # 检查响应
+          if echo "$RESPONSE" | jq -e '.code == 0' >/dev/null 2>&1; then
+            echo "✅ 飞书通知已发送"
+          else
+            echo "❌ 发送失败: $RESPONSE"
+          fi
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
